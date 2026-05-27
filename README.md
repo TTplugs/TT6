@@ -150,7 +150,7 @@ make check
 
 ## DX7 to TT6 converter
 
-The converter has been moved to the standalone repository `TT6_Converter`.
+The converter has been moved to the standalone repository: https://github.com/TTplugs/TT6_Converter.
 
 The expected output of `make check`:
 
@@ -202,7 +202,6 @@ LV2 search path through the usual workflow and re-scan plugins.
 
 ## Known limitations / roadmap
 
-  starting presets, not strict 1:1 timbral equivalence.
 - No mod matrix yet; LFO routes to pitch only.
 - No effects after the synth (reverb/delay) intentionally; use a
   separate LV2 effect plugin on the S2400.
