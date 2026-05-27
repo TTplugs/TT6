@@ -2,10 +2,14 @@
  * TT6 - 6-operator altered FM synthesizer for Isla S2400
  * TTLab - GPL-2.0-only
  *
- * Original DSP. Inspired by classic 6-operator FM synthesis
+ * Polyphonic revision:
+ * - fixed 8 voices
+ * - voice stealing
+ * - sample-accurate MIDI event timing inside each block
+ *
+ * Inspired by classic 6-operator FM synthesis
  * (phase modulation, ring modulation, wave folding).
  * Not affiliated with or endorsed by Yamaha or Korg.
- * No trademarked names, GUI, or samples are used.
  */
 
 #include <math.h>
@@ -16,8 +20,16 @@
 #include "lv2/core/lv2.h"
 #include "lv2/atom/atom.h"
 #include "lv2/atom/util.h"
+#include "lv2/midi/midi.h"
+#include "lv2/urid/urid.h"
 
 static const char* kUri = "urn:asier:lv2:tt6";
+static const char* kUridMapFeature = "http://lv2plug.in/ns/ext/urid#map";
+
+typedef struct {
+  void* handle;
+  LV2_URID (*map)(void* handle, const char* uri);
+} LV2_URID_Map;
 
 enum PortIndex : uint32_t {
   MIDI_IN = 0,
@@ -136,6 +148,23 @@ static const AlgoSpec kAlgos[16] = {
   /* 15 Drone          */ { 0x3F, { 0, 0,    0,    0,    0,    0x10 } }
 };
 
+static constexpr int kOpCount = 6;
+static constexpr int kVoiceCount = 8;
+static constexpr uint32_t kMaxMidiEventsPerBlock = 256u;
+
+struct Voice {
+  float phase[kOpCount];
+  float op_env[kOpCount];
+  float op_prev[kOpCount];
+  float attack_phase;
+  float base_hz;
+  float velocity_gain;
+  int note;
+  bool gate;
+  bool active;
+  uint32_t age;
+};
+
 struct Plugin {
   float sr;
   float* out_l;
@@ -143,30 +172,23 @@ struct Plugin {
   const float* controls[kParamCount];
   const LV2_Atom_Sequence* midi_in;
 
+  LV2_URID_Map* map;
+  LV2_URID midi_event_urid;
+
   float smooth[kParamCount];
 
-  /* per-op state */
-  float phase[6];
-  float op_env[6];
-  float op_prev[6];
+  Voice voices[kVoiceCount];
+  uint32_t voice_counter;
 
-  /* envelope state */
-  float attack_phase;
-  bool gate;
-  int held_note;
-
-  /* base pitch from MIDI */
-  float base_hz;
-
-  /* velocity */
-  float velocity_gain;
-
-  /* filter state (state-variable LP) */
+  /* Global filter and LFO */
   float svf_lp;
   float svf_bp;
-
-  /* LFO */
   float lfo_phase;
+};
+
+struct MidiEventItem {
+  uint32_t frame;
+  uint8_t data[3];
 };
 
 static constexpr float kPi = 3.14159265358979323846f;
@@ -255,74 +277,193 @@ static float note_to_hz(int note) {
   return finite_or(440.0f * semitone_ratio(static_cast<float>(note - 69)), 440.0f);
 }
 
+static void reset_voice(Voice* v) {
+  if (!v) return;
+  for (int i = 0; i < kOpCount; ++i) {
+    v->phase[i] = 0.0f;
+    v->op_env[i] = 0.0f;
+    v->op_prev[i] = 0.0f;
+  }
+  v->attack_phase = 0.0f;
+  v->base_hz = 220.0f;
+  v->velocity_gain = 1.0f;
+  v->note = -1;
+  v->gate = false;
+  v->active = false;
+  v->age = 0u;
+}
+
+static float voice_energy(const Voice* v) {
+  if (!v) return 0.0f;
+  float e = clamp(v->attack_phase, 0.0f, 1.0f) * 0.6f;
+  for (int i = 0; i < kOpCount; ++i) {
+    e += clamp(v->op_env[i], 0.0f, 1.0f) * 0.07f;
+  }
+  return e;
+}
+
+static bool voice_is_quiet(const Voice* v) {
+  return voice_energy(v) < 1.0e-4f;
+}
+
 static void init_plugin(Plugin* p, float sr) {
   memset(p, 0, sizeof(Plugin));
   p->sr = sr;
-  p->velocity_gain = 1.0f;
-  p->base_hz = 220.0f;
-  p->held_note = -1;
-  p->gate = false;
+  p->midi_event_urid = 0;
   for (uint32_t i = 0; i < kParamCount; ++i) {
     p->controls[i] = nullptr;
     p->smooth[i] = kParamDefs[i].def;
+  }
+  for (int v = 0; v < kVoiceCount; ++v) {
+    reset_voice(&p->voices[v]);
   }
 }
 
 static void reset_dsp_state(Plugin* p) {
   if (!p) return;
-  for (int i = 0; i < 6; ++i) {
-    p->phase[i] = 0.0f;
-    p->op_env[i] = 0.0f;
-    p->op_prev[i] = 0.0f;
+  for (int v = 0; v < kVoiceCount; ++v) {
+    reset_voice(&p->voices[v]);
   }
-  p->attack_phase = 0.0f;
-  p->gate = false;
-  p->held_note = -1;
-  p->velocity_gain = 1.0f;
+  p->voice_counter = 0u;
   p->svf_lp = 0.0f;
   p->svf_bp = 0.0f;
   p->lfo_phase = 0.0f;
 }
 
-static void trigger(Plugin* p, int note, float velocity) {
+static int allocate_voice(Plugin* p, int note) {
+  if (!p) return 0;
+
+  int free_voice = -1;
+  int same_note_voice = -1;
+  int quiet_released_voice = -1;
+  float quiet_energy = 1.0e9f;
+  int oldest_voice = 0;
+  uint32_t oldest_age = UINT32_MAX;
+
+  for (int v = 0; v < kVoiceCount; ++v) {
+    const Voice* voice = &p->voices[v];
+    if (!voice->active) {
+      free_voice = v;
+      break;
+    }
+    if (voice->gate && voice->note == note) {
+      same_note_voice = v;
+    }
+    if (!voice->gate) {
+      const float e = voice_energy(voice);
+      if (e < quiet_energy) {
+        quiet_energy = e;
+        quiet_released_voice = v;
+      }
+    }
+    if (voice->age < oldest_age) {
+      oldest_age = voice->age;
+      oldest_voice = v;
+    }
+  }
+
+  if (same_note_voice >= 0) return same_note_voice;
+  if (free_voice >= 0) return free_voice;
+  if (quiet_released_voice >= 0) return quiet_released_voice;
+  return oldest_voice;
+}
+
+static void note_on(Plugin* p, int note, float velocity) {
   if (!p) return;
   velocity = clamp(velocity, 0.0f, 1.0f);
+  const int v_idx = allocate_voice(p, note);
+  Voice* v = &p->voices[v_idx];
+
   const float vel_amt = clamp(p->smooth[P_VEL_AMOUNT], 0.0f, 1.0f);
-  p->velocity_gain = clamp((1.0f - vel_amt) + velocity * vel_amt, 0.0f, 1.0f);
-  p->held_note = note;
-  p->base_hz = note_to_hz(note);
-  p->gate = true;
-  p->attack_phase = 0.0f;
-  for (int i = 0; i < 6; ++i) {
-    p->op_env[i] = 1.0f;
-    p->phase[i] = 0.0f;
+  v->velocity_gain = clamp((1.0f - vel_amt) + velocity * vel_amt, 0.0f, 1.0f);
+  v->note = note;
+  v->base_hz = note_to_hz(note);
+  v->gate = true;
+  v->active = true;
+  v->attack_phase = 0.0f;
+  v->age = ++p->voice_counter;
+  for (int i = 0; i < kOpCount; ++i) {
+    v->phase[i] = 0.0f;
+    v->op_env[i] = 1.0f;
+    v->op_prev[i] = 0.0f;
   }
-  /* Do NOT zero op_prev to avoid clicks if a previous note was decaying;
-   * feedback path will simply continue smoothly. */
 }
 
-static void release_note(Plugin* p, int note) {
+static void note_off(Plugin* p, int note) {
   if (!p) return;
-  /* Only release if the released note matches the held one (mono) */
-  if (note == p->held_note || note < 0) {
-    p->gate = false;
-    p->held_note = -1;
+  for (int v = 0; v < kVoiceCount; ++v) {
+    Voice* voice = &p->voices[v];
+    if (voice->active && voice->gate && voice->note == note) {
+      voice->gate = false;
+    }
   }
 }
 
-static void handle_midi(Plugin* p) {
-  if (!p || !p->midi_in) return;
-  if (p->midi_in->atom.size < 8u) return;
+static void all_notes_off(Plugin* p) {
+  if (!p) return;
+  for (int v = 0; v < kVoiceCount; ++v) {
+    Voice* voice = &p->voices[v];
+    if (voice->active) {
+      voice->gate = false;
+      voice->note = -1;
+    }
+  }
+}
 
+static uint32_t collect_midi_events(const Plugin* p, MidiEventItem* events, uint32_t max_events, uint32_t nframes) {
+  if (!p || !events || max_events == 0u || !p->midi_in || p->midi_in->atom.size < 8u || nframes == 0u) {
+    return 0u;
+  }
+
+  uint32_t count = 0u;
   LV2_ATOM_SEQUENCE_FOREACH(p->midi_in, ev) {
+    if (count >= max_events) {
+      break;
+    }
+    if (ev->body.size < 3u) {
+      continue;
+    }
+    if (p->midi_event_urid != 0u && ev->body.type != p->midi_event_urid) {
+      continue;
+    }
+
     const uint8_t* msg = reinterpret_cast<const uint8_t*>(ev + 1);
-    if (ev->body.size < 3u) continue;
     const uint8_t status = msg[0] & 0xF0u;
-    if (status == 0x90u && msg[2] > 0u) {
-      trigger(p, static_cast<int>(msg[1]),
-              clamp(static_cast<float>(msg[2]) / 127.0f, 0.0f, 1.0f));
-    } else if (status == 0x80u || (status == 0x90u && msg[2] == 0u)) {
-      release_note(p, static_cast<int>(msg[1]));
+    if (status != 0x80u && status != 0x90u && status != 0xB0u) {
+      continue;
+    }
+
+    uint32_t frame = 0u;
+    if (ev->time.frames > 0) {
+      const int64_t f = ev->time.frames;
+      frame = (f >= static_cast<int64_t>(nframes)) ? (nframes - 1u) : static_cast<uint32_t>(f);
+    }
+
+    events[count].frame = frame;
+    events[count].data[0] = msg[0];
+    events[count].data[1] = msg[1];
+    events[count].data[2] = msg[2];
+    ++count;
+  }
+
+  return count;
+}
+
+static void dispatch_midi(Plugin* p, const MidiEventItem* ev) {
+  if (!p || !ev) return;
+  const uint8_t status = ev->data[0] & 0xF0u;
+  if (status == 0x90u && ev->data[2] > 0u) {
+    note_on(p, static_cast<int>(ev->data[1]), clamp(static_cast<float>(ev->data[2]) / 127.0f, 0.0f, 1.0f));
+    return;
+  }
+  if (status == 0x80u || (status == 0x90u && ev->data[2] == 0u)) {
+    note_off(p, static_cast<int>(ev->data[1]));
+    return;
+  }
+  if (status == 0xB0u) {
+    const uint8_t cc = ev->data[1];
+    if (cc == 120u || cc == 123u) {
+      all_notes_off(p);
     }
   }
 }
@@ -347,11 +488,113 @@ static float process_filter(Plugin* p, float x, float cutoff_hz, float resonance
   return finite_or(p->svf_lp, 0.0f);
 }
 
-static LV2_Handle instantiate(const LV2_Descriptor*, double rate, const char*, const LV2_Feature* const*) {
+static float render_voice_sample(Voice* v,
+                                 float sr,
+                                 const AlgoSpec& algo,
+                                 int mode_idx,
+                                 float base_hz,
+                                 const float op_ratio[kOpCount],
+                                 const float op_level[kOpCount],
+                                 const float decay_coef[kOpCount],
+                                 float attack_coef,
+                                 float sustain,
+                                 float release_coef,
+                                 float feedback) {
+  if (!v || !v->active) return 0.0f;
+
+  if (v->gate) {
+    v->attack_phase += (1.0f - v->attack_phase) * (1.0f - attack_coef);
+    v->attack_phase = zap(clamp(v->attack_phase, 0.0f, 1.0f));
+    for (int o = 0; o < kOpCount; ++o) {
+      v->op_env[o] += (sustain - v->op_env[o]) * (1.0f - decay_coef[o]);
+      v->op_env[o] = zap(clamp(v->op_env[o], 0.0f, 1.0f));
+    }
+  } else {
+    for (int o = 0; o < kOpCount; ++o) {
+      v->op_env[o] = zap(clamp(v->op_env[o] * release_coef, 0.0f, 1.0f));
+    }
+  }
+
+  if (!v->gate && voice_is_quiet(v)) {
+    reset_voice(v);
+    return 0.0f;
+  }
+
+  const float master_amp = clamp(v->attack_phase, 0.0f, 1.0f);
+
+  float op_out[kOpCount];
+  for (int o = 0; o < kOpCount; ++o) {
+    float mod_in = 0.0f;
+    const uint8_t mask = algo.mod_in[o];
+    for (int j = 0; j < kOpCount; ++j) {
+      if (mask & (1u << j)) {
+        if (j < o) {
+          mod_in += op_out[j] * op_level[j] * v->op_env[j];
+        } else if (j == o && o == 5) {
+          mod_in += v->op_prev[5] * feedback;
+        }
+      }
+    }
+
+    const float hz = clamp(base_hz * op_ratio[o], 0.1f, sr * 0.45f);
+    v->phase[o] = wrap_phase(v->phase[o] + kTwoPi * hz / sr);
+
+    float y;
+    if (mode_idx == 0) {
+      y = sinf(v->phase[o] + mod_in * kModIndexScale);
+    } else if (mode_idx == 1) {
+      const float c = sinf(v->phase[o]);
+      y = c * clamp(1.0f + mod_in * 3.0f, -3.0f, 3.0f);
+      y = clamp(y, -2.0f, 2.0f);
+    } else {
+      y = wavefold(sinf(v->phase[o]) + mod_in * 1.5f);
+    }
+    op_out[o] = zap(finite_or(y, 0.0f));
+  }
+  v->op_prev[5] = op_out[5];
+
+  float mix = 0.0f;
+  int n_carriers = 0;
+  for (int o = 0; o < kOpCount; ++o) {
+    if (algo.carriers & (1u << o)) {
+      mix += op_out[o] * v->op_env[o] * op_level[o];
+      ++n_carriers;
+    }
+  }
+
+  if (n_carriers > 1) {
+    const float comp = 1.0f / (0.6f + 0.4f * static_cast<float>(n_carriers));
+    mix *= comp * 1.4f;
+  }
+
+  return mix * master_amp * v->velocity_gain;
+}
+
+static LV2_Handle instantiate(const LV2_Descriptor*,
+                              double rate,
+                              const char*,
+                              const LV2_Feature* const* features) {
   Plugin* p = static_cast<Plugin*>(calloc(1, sizeof(Plugin)));
   if (!p) return nullptr;
-  const float sr = (finite_double(rate) && rate >= 1000.0 && rate <= 384000.0) ? static_cast<float>(rate) : kRefSampleRate;
+
+  const float sr = (finite_double(rate) && rate >= 1000.0 && rate <= 384000.0)
+                     ? static_cast<float>(rate)
+                     : kRefSampleRate;
   init_plugin(p, sr);
+
+  if (features) {
+    for (uint32_t i = 0; features[i]; ++i) {
+      const LV2_Feature* f = features[i];
+      if (f && f->URI && strcmp(f->URI, kUridMapFeature) == 0) {
+        p->map = (LV2_URID_Map*)f->data;
+        break;
+      }
+    }
+  }
+  if (p->map && p->map->map) {
+    p->midi_event_urid = p->map->map(p->map->handle, LV2_MIDI__MidiEvent);
+  }
+
   return p;
 }
 
@@ -403,154 +646,118 @@ static void activate(LV2_Handle instance) {
 
 static void run(LV2_Handle instance, uint32_t n) {
   Plugin* p = static_cast<Plugin*>(instance);
-  if (!p || !p->out_l || !p->out_r) return;
-
-  handle_midi(p);
+  if (!p || !p->out_l || !p->out_r || n == 0u) return;
 
   const float sr = sample_rate(p);
   const float smooth_coeff = 1.0f - time_coef_ms(p, 8.0f);
 
-  /* Per-op decay coefficients computed once per block */
-  const float decay_coef[6] = {
-    time_coef_ms(p, p->smooth[P_OP1_DECAY]),
-    time_coef_ms(p, p->smooth[P_OP2_DECAY]),
-    time_coef_ms(p, p->smooth[P_OP3_DECAY]),
-    time_coef_ms(p, p->smooth[P_OP4_DECAY]),
-    time_coef_ms(p, p->smooth[P_OP5_DECAY]),
-    time_coef_ms(p, p->smooth[P_OP6_DECAY])
-  };
-  const float release_coef = time_coef_ms(p, p->smooth[P_RELEASE]);
-  const float attack_coef = time_coef_ms(p, p->smooth[P_ATTACK]);
+  float target[kParamCount];
+  for (uint32_t pidx = 0; pidx < kParamCount; ++pidx) {
+    const ParamDef* def = &kParamDefs[pidx];
+    const float raw = p->controls[pidx] ? *p->controls[pidx] : def->def;
+    target[pidx] = quantize_2(clamp(raw, def->min, def->max));
+  }
 
-  /* Resolve enum params once per block */
-  int algo_idx = nearest_int(p->smooth[P_ALGO]);
-  if (algo_idx < 0) algo_idx = 0;
-  if (algo_idx > 15) algo_idx = 15;
-  const AlgoSpec& algo = kAlgos[algo_idx];
+  MidiEventItem midi_events[kMaxMidiEventsPerBlock];
+  const uint32_t midi_count = collect_midi_events(p, midi_events, kMaxMidiEventsPerBlock, n);
+  uint32_t midi_index = 0u;
 
-  int mode_idx = nearest_int(p->smooth[P_OP_MODE]);
-  if (mode_idx < 0) mode_idx = 0;
-  if (mode_idx > 2) mode_idx = 2;
-
-  const float feedback = clamp(p->smooth[P_FEEDBACK], 0.0f, 1.0f) * 0.9f;
-  const float sustain = clamp(p->smooth[P_SUSTAIN], 0.0f, 1.0f);
-  const float lfo_hz = clamp(p->smooth[P_LFO_RATE], 0.05f, 30.0f);
-  const float lfo_depth = clamp(p->smooth[P_LFO_DEPTH], 0.0f, 1.0f);
-
-  /* Op ratios cached */
-  const float op_ratio[6] = {
-    clamp(p->smooth[P_OP1_RATIO], 0.25f, 32.0f),
-    clamp(p->smooth[P_OP2_RATIO], 0.25f, 32.0f),
-    clamp(p->smooth[P_OP3_RATIO], 0.25f, 32.0f),
-    clamp(p->smooth[P_OP4_RATIO], 0.25f, 32.0f),
-    clamp(p->smooth[P_OP5_RATIO], 0.25f, 32.0f),
-    clamp(p->smooth[P_OP6_RATIO], 0.25f, 32.0f)
-  };
-  const float op_level[6] = {
-    clamp(p->smooth[P_OP1_LEVEL], 0.0f, 1.0f),
-    clamp(p->smooth[P_OP2_LEVEL], 0.0f, 1.0f),
-    clamp(p->smooth[P_OP3_LEVEL], 0.0f, 1.0f),
-    clamp(p->smooth[P_OP4_LEVEL], 0.0f, 1.0f),
-    clamp(p->smooth[P_OP5_LEVEL], 0.0f, 1.0f),
-    clamp(p->smooth[P_OP6_LEVEL], 0.0f, 1.0f)
-  };
+  float decay_coef[kOpCount] = {0};
+  float attack_coef = time_coef_ms(p, p->smooth[P_ATTACK]);
+  float release_coef = time_coef_ms(p, p->smooth[P_RELEASE]);
 
   for (uint32_t i = 0; i < n; ++i) {
-    /* Smooth all params */
+    while (midi_index < midi_count && midi_events[midi_index].frame <= i) {
+      dispatch_midi(p, &midi_events[midi_index]);
+      ++midi_index;
+    }
+
     for (uint32_t pidx = 0; pidx < kParamCount; ++pidx) {
       const ParamDef* def = &kParamDefs[pidx];
-      const float target = quantize_2(clamp(p->controls[pidx] ? *p->controls[pidx] : def->def, def->min, def->max));
-      p->smooth[pidx] += (target - p->smooth[pidx]) * smooth_coeff;
+      p->smooth[pidx] += (target[pidx] - p->smooth[pidx]) * smooth_coeff;
       p->smooth[pidx] = zap(clamp(p->smooth[pidx], def->min, def->max));
     }
 
-    /* LFO (pitch vibrato) */
-    p->lfo_phase = wrap_phase(p->lfo_phase + kTwoPi * lfo_hz / sr);
+    /* Recompute time constants every 16 samples for lower CPU. */
+    if ((i & 15u) == 0u) {
+      attack_coef = time_coef_ms(p, p->smooth[P_ATTACK]);
+      release_coef = time_coef_ms(p, p->smooth[P_RELEASE]);
+      decay_coef[0] = time_coef_ms(p, p->smooth[P_OP1_DECAY]);
+      decay_coef[1] = time_coef_ms(p, p->smooth[P_OP2_DECAY]);
+      decay_coef[2] = time_coef_ms(p, p->smooth[P_OP3_DECAY]);
+      decay_coef[3] = time_coef_ms(p, p->smooth[P_OP4_DECAY]);
+      decay_coef[4] = time_coef_ms(p, p->smooth[P_OP5_DECAY]);
+      decay_coef[5] = time_coef_ms(p, p->smooth[P_OP6_DECAY]);
+    }
+
+    int algo_idx = nearest_int(p->smooth[P_ALGO]);
+    if (algo_idx < 0) algo_idx = 0;
+    if (algo_idx > 15) algo_idx = 15;
+    const AlgoSpec& algo = kAlgos[algo_idx];
+
+    int mode_idx = nearest_int(p->smooth[P_OP_MODE]);
+    if (mode_idx < 0) mode_idx = 0;
+    if (mode_idx > 2) mode_idx = 2;
+
+    const float feedback = clamp(p->smooth[P_FEEDBACK], 0.0f, 1.0f) * 0.9f;
+    const float sustain = clamp(p->smooth[P_SUSTAIN], 0.0f, 1.0f);
+
+    const float op_ratio[kOpCount] = {
+      clamp(p->smooth[P_OP1_RATIO], 0.25f, 32.0f),
+      clamp(p->smooth[P_OP2_RATIO], 0.25f, 32.0f),
+      clamp(p->smooth[P_OP3_RATIO], 0.25f, 32.0f),
+      clamp(p->smooth[P_OP4_RATIO], 0.25f, 32.0f),
+      clamp(p->smooth[P_OP5_RATIO], 0.25f, 32.0f),
+      clamp(p->smooth[P_OP6_RATIO], 0.25f, 32.0f)
+    };
+    const float op_level[kOpCount] = {
+      clamp(p->smooth[P_OP1_LEVEL], 0.0f, 1.0f),
+      clamp(p->smooth[P_OP2_LEVEL], 0.0f, 1.0f),
+      clamp(p->smooth[P_OP3_LEVEL], 0.0f, 1.0f),
+      clamp(p->smooth[P_OP4_LEVEL], 0.0f, 1.0f),
+      clamp(p->smooth[P_OP5_LEVEL], 0.0f, 1.0f),
+      clamp(p->smooth[P_OP6_LEVEL], 0.0f, 1.0f)
+    };
+
+    p->lfo_phase = wrap_phase(p->lfo_phase + kTwoPi * clamp(p->smooth[P_LFO_RATE], 0.05f, 30.0f) / sr);
+    const float lfo_depth = clamp(p->smooth[P_LFO_DEPTH], 0.0f, 1.0f);
     const float lfo = sinf(p->lfo_phase) * lfo_depth;
-    const float lfo_pitch_mul = semitone_ratio(lfo * 2.0f);  /* +/- 2 st max */
+    const float lfo_pitch_mul = semitone_ratio(lfo * 2.0f);  /* +/-2 semitones */
 
-    const float base_hz = clamp(p->base_hz * lfo_pitch_mul, 1.0f, sr * 0.45f);
-
-    /* Envelope: gate-on -> decay toward sustain, gate-off -> release toward 0 */
-    if (p->gate) {
-      p->attack_phase += (1.0f - p->attack_phase) * (1.0f - attack_coef);
-      for (int o = 0; o < 6; ++o) {
-        p->op_env[o] += (sustain - p->op_env[o]) * (1.0f - decay_coef[o]);
-        p->op_env[o] = zap(clamp(p->op_env[o], 0.0f, 1.0f));
-      }
-    } else {
-      for (int o = 0; o < 6; ++o) {
-        p->op_env[o] = zap(clamp(p->op_env[o] * release_coef, 0.0f, 1.0f));
-      }
-      /* Keep attack_phase as is for next note (will be reset on trigger) */
-    }
-    const float master_amp = clamp(p->attack_phase, 0.0f, 1.0f);
-
-    /* Render all 6 operators in topological order (0..5) */
-    float op_out[6];
-    for (int o = 0; o < 6; ++o) {
-      float mod_in = 0.0f;
-      const uint8_t mask = algo.mod_in[o];
-      for (int j = 0; j < 6; ++j) {
-        if (mask & (1u << j)) {
-          /* j must be < o for DAG order, OR o==5 && j==5 (self-feedback) */
-          if (j < o) {
-            mod_in += op_out[j] * op_level[j] * p->op_env[j];
-          } else if (j == o && o == 5) {
-            mod_in += p->op_prev[5] * feedback;
-          }
-        }
-      }
-
-      const float hz = clamp(base_hz * op_ratio[o], 0.1f, sr * 0.45f);
-      p->phase[o] = wrap_phase(p->phase[o] + kTwoPi * hz / sr);
-
-      float y;
-      if (mode_idx == 0) {
-        /* FM (phase modulation) */
-        y = sinf(p->phase[o] + mod_in * kModIndexScale);
-      } else if (mode_idx == 1) {
-        /* Ring modulation: carrier sine multiplied by (1 + mod) */
-        const float c = sinf(p->phase[o]);
-        y = c * clamp(1.0f + mod_in * 3.0f, -3.0f, 3.0f);
-        y = clamp(y, -2.0f, 2.0f);
-      } else {
-        /* Wave folder */
-        y = wavefold(sinf(p->phase[o]) + mod_in * 1.5f);
-      }
-      op_out[o] = zap(finite_or(y, 0.0f));
-    }
-    p->op_prev[5] = op_out[5];
-
-    /* Sum carriers */
     float mix = 0.0f;
-    int n_carriers = 0;
-    for (int o = 0; o < 6; ++o) {
-      if (algo.carriers & (1u << o)) {
-        mix += op_out[o] * p->op_env[o] * op_level[o];
-        ++n_carriers;
+    int live_voices = 0;
+    for (int v = 0; v < kVoiceCount; ++v) {
+      Voice* voice = &p->voices[v];
+      if (!voice->active) continue;
+      const float voice_hz = clamp(voice->base_hz * lfo_pitch_mul, 1.0f, sr * 0.45f);
+      mix += render_voice_sample(voice,
+                                 sr,
+                                 algo,
+                                 mode_idx,
+                                 voice_hz,
+                                 op_ratio,
+                                 op_level,
+                                 decay_coef,
+                                 attack_coef,
+                                 sustain,
+                                 release_coef,
+                                 feedback);
+      if (voice->active) {
+        ++live_voices;
       }
     }
-    /* Mild gain compensation for additive carriers (avoid blowout on
-     * additive algorithms while keeping single-carrier algos punchy). */
-    if (n_carriers > 1) {
-      const float comp = 1.0f / (0.6f + 0.4f * static_cast<float>(n_carriers));
-      mix *= comp * 1.4f;
+
+    if (live_voices > 1) {
+      mix *= 1.0f / (0.8f + 0.2f * static_cast<float>(live_voices));
     }
 
-    /* Master amp envelope and velocity */
-    float out = mix * master_amp * p->velocity_gain;
+    float out = process_filter(p, mix, p->smooth[P_FILTER_CUTOFF], p->smooth[P_FILTER_RES]);
 
-    /* Filter */
-    out = process_filter(p, out, p->smooth[P_FILTER_CUTOFF], p->smooth[P_FILTER_RES]);
-
-    /* Drive */
     const float drive = clamp(p->smooth[P_DRIVE], 0.0f, 1.0f);
     if (drive > 0.0001f) {
       out = soft_clip(out * (1.0f + drive * 8.0f)) / (1.0f + drive * 0.6f);
     }
 
-    /* Gain in dB and final safety limiter */
     out *= db_to_gain(p->smooth[P_GAIN]);
     out = clamp(finite_or(out, 0.0f), -1.0f, 1.0f);
 

@@ -1,4 +1,4 @@
-> **WIP:** TT6 is an early S2400-focused LV2 instrument prototype. Six-operator altered FM voice. Monophonic in this first version.
+> **WIP:** TT6 is an early S2400-focused LV2 instrument prototype. Six-operator altered FM voice. Polyphonic 8-voice engine in active development.
 
 # TT6 for S2400
 
@@ -17,13 +17,16 @@ synthesis (DX7) and modern altered-FM ideas (ring modulation, wave folding).
 - No audio input.
 - No GUI extension.
 - 31 LV2 control parameters, below the S2400 32-parameter limit.
-- Monophonic in this version (one note at a time). Polyphony deferred.
+- Fixed 8-voice polyphony with voice stealing.
 
 ## Synth architecture
 
 - 6 operators numbered 1-6, each a sine oscillator with its own
   frequency ratio relative to the played MIDI note, output level,
   and exponential decay envelope.
+- Fixed 8-voice poly engine. Note-on allocates a free voice first,
+  then a quiet released voice, then oldest voice (steal).
+- MIDI is processed sample-accurate inside each audio block.
 - 16 fixed algorithms select which operators modulate which.
   Operators are processed in DAG order (op1 first, op6 last).
 - Operator 6 has a one-sample-delayed self-feedback path
@@ -135,6 +138,53 @@ make
 make check
 ```
 
+If you are already on the VM and the repo is in `~/TT6`:
+
+```bash
+cd ~/TT6
+git pull --ff-only
+make clean
+make
+make check
+```
+
+## DX7 to TT6 converter
+
+The converter script is included at:
+
+```bash
+scripts/dx7_to_tt6.py
+```
+
+It reads DX7 SysEx (single voice or 32-voice bank) and outputs TT6
+parameters as JSON and/or FXP.
+
+Basic usage:
+
+```bash
+python3 scripts/dx7_to_tt6.py INPUT.syx --patch-index 0 --print
+python3 scripts/dx7_to_tt6.py INPUT.syx --patch-index 0 \
+  --output-json tt6_patch.json \
+  --output-fxp TT6_patch.fxp
+```
+
+Use a reference FXP (for header fields as saved by S2400 host flow):
+
+```bash
+python3 scripts/dx7_to_tt6.py INPUT.syx --patch-index 0 \
+  --template-fxp kick01.FXP \
+  --output-fxp TT6_patch.fxp \
+  --output-json TT6_patch.json
+```
+
+Notes:
+
+- Converter keeps TT6 control order exactly as ports 3..33.
+- Mapping from DX7 envelope/ratio space to TT6 is heuristic and musical,
+  not a bit-identical emulation of DX7 engine behavior.
+- `--fxid` and `--fx-version` are available if you want fixed values
+  without using `--template-fxp`.
+
 The expected output of `make check`:
 
 - `file` reports `ELF 64-bit LSB shared object, ARM aarch64`
@@ -185,8 +235,8 @@ LV2 search path through the usual workflow and re-scan plugins.
 
 ## Known limitations / roadmap
 
-- Monophonic only. Polyphony with voice stealing is the next obvious
-  step but expands per-voice state x N. Pending.
+- DX7 -> TT6 conversion is intentionally approximate and tuned for usable
+  starting presets, not strict 1:1 timbral equivalence.
 - No mod matrix yet; LFO routes to pitch only.
 - No effects after the synth (reverb/delay) intentionally; use a
   separate LV2 effect plugin on the S2400.
