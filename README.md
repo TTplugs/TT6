@@ -150,40 +150,7 @@ make check
 
 ## DX7 to TT6 converter
 
-The converter script is included at:
-
-```bash
-scripts/dx7_to_tt6.py
-```
-
-It reads DX7 SysEx (single voice or 32-voice bank) and outputs TT6
-parameters as JSON and/or FXP.
-
-Basic usage:
-
-```bash
-python3 scripts/dx7_to_tt6.py INPUT.syx --patch-index 0 --print
-python3 scripts/dx7_to_tt6.py INPUT.syx --patch-index 0 \
-  --output-json tt6_patch.json \
-  --output-fxp TT6_patch.fxp
-```
-
-Use a reference FXP (for header fields as saved by S2400 host flow):
-
-```bash
-python3 scripts/dx7_to_tt6.py INPUT.syx --patch-index 0 \
-  --template-fxp kick01.FXP \
-  --output-fxp TT6_patch.fxp \
-  --output-json TT6_patch.json
-```
-
-Notes:
-
-- Converter keeps TT6 control order exactly as ports 3..33.
-- Mapping from DX7 envelope/ratio space to TT6 is heuristic and musical,
-  not a bit-identical emulation of DX7 engine behavior.
-- `--fxid` and `--fx-version` are available if you want fixed values
-  without using `--template-fxp`.
+The converter has been moved to the standalone repository `TT6_Converter`.
 
 The expected output of `make check`:
 
@@ -235,7 +202,6 @@ LV2 search path through the usual workflow and re-scan plugins.
 
 ## Known limitations / roadmap
 
-- DX7 -> TT6 conversion is intentionally approximate and tuned for usable
   starting presets, not strict 1:1 timbral equivalence.
 - No mod matrix yet; LFO routes to pitch only.
 - No effects after the synth (reverb/delay) intentionally; use a
